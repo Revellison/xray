@@ -409,6 +409,7 @@ type Config struct {
 	BurstObservatory *BurstObservatoryConfig `json:"burstObservatory"`
 	Version          *VersionConfig          `json:"version"`
 	Geodata          *GeodataConfig          `json:"geodata"`
+	SpeedLimit       *SpeedLimitConfig       `json:"speedLimit"`
 }
 
 func (c *Config) findInboundTag(tag string) int {
@@ -491,6 +492,10 @@ func (c *Config) Override(o *Config, fn string) {
 		c.Geodata = o.Geodata
 	}
 
+	if o.SpeedLimit != nil {
+		c.SpeedLimit = o.SpeedLimit
+	}
+
 	// update the Inbound in slice if the only one in override config has same tag
 	if len(o.InboundConfigs) > 0 {
 		for i := range o.InboundConfigs {
@@ -538,6 +543,12 @@ func (c *Config) Build() (*core.Config, error) {
 
 	if err := PostProcessConfigureFile(c); err != nil {
 		return nil, errors.New("failed to post-process configuration file").Base(err)
+	}
+
+	if c.SpeedLimit != nil {
+		if err := c.SpeedLimit.Apply(); err != nil {
+			return nil, errors.New("failed to apply speed limit configuration").Base(err)
+		}
 	}
 
 	config := &core.Config{

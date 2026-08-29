@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/app/limiter"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -159,6 +160,17 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	}
 
 	if user != nil && len(user.Email) > 0 {
+		// Speed limit, if any. inboundLink.Writer carries the uplink and
+		// outboundLink.Writer the downlink, as the stat counters below confirm.
+		// Wrapped before the stat writers so a SizeStatWriter stays the
+		// outermost writer: proxy.CopyRawConnIfExist type-asserts it to account
+		// for spliced traffic.
+		if limiter.Global.Enabled() {
+			disableSpliceForLimitedUser(sessionInbound, user.Email)
+			inboundLink.Writer = limiter.Global.WrapUplinkWriter(ctx, user.Email, inboundLink.Writer)
+			outboundLink.Writer = limiter.Global.WrapDownlinkWriter(ctx, user.Email, outboundLink.Writer)
+		}
+
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
@@ -194,6 +206,19 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		user = sessionInbound.User
 	}
 
+	// Speed limit, if any. On this path the uplink reaches us as link.Reader and
+	// the downlink as link.Writer, as the stat counters below confirm. The rate
+	// reader is installed inside the TimeoutWrapperReader so that one stays the
+	// outermost reader (DispatchLink asserts it to buf.TimeoutReader), and the
+	// rate writer inside the stat writer so a SizeStatWriter stays the outermost
+	// writer (proxy.CopyRawConnIfExist type-asserts it to account for spliced
+	// traffic).
+	if user != nil && len(user.Email) > 0 && limiter.Global.Enabled() {
+		disableSpliceForLimitedUser(sessionInbound, user.Email)
+		link.Reader = limiter.Global.WrapUplinkReader(ctx, user.Email, link.Reader)
+		link.Writer = limiter.Global.WrapDownlinkWriter(ctx, user.Email, link.Writer)
+	}
+
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 
 	if user != nil && len(user.Email) > 0 {
@@ -219,6 +244,18 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	}
 
 	return link
+}
+
+// disableSpliceForLimitedUser opts a rate limited user out of the kernel splice
+// fast path. Spliced traffic is copied socket to socket and never reaches the
+// reader/writer chain the limiter hooks into, so it would escape the limit
+// entirely. Setting it on the inbound is enough: proxy.CopyRawConnIfExist only
+// splices when the inbound and every outbound allow it. Limited users lose
+// nothing that matters, since splice only pays off well above their cap.
+func disableSpliceForLimitedUser(inbound *session.Inbound, email string) {
+	if inbound != nil && limiter.Global.Limit(email).IsLimited() {
+		inbound.CanSpliceCopy = 3 // 3 = cannot
+	}
 }
 
 func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
